@@ -16,7 +16,6 @@
 | :--- | :--- | :--- |
 | `TG_TOKEN` | `123456:ABC...` | Telegram 搜索 `@BotFather` -> `/newbot` |
 | `TG_ID` | `123456789` | Telegram 搜索 `@userinfobot` 查看 ID |
-| `HF_TOKEN` | `hf_xxxx...` | (仅私有Space需要) Hugging Face 设置 -> Access Tokens |
 
 ### 2. 修改 Space 列表
 编辑 `.github/workflows/keep_alive.yml`，找到 `matrix.url` 部分，填入你的 Space 链接。
