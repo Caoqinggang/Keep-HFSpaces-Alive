@@ -12,7 +12,7 @@ jobs:
       fail-fast: false # 如果一个Space失败，不要取消其他Space的任务
       matrix:
         url: [
-          "https://huggingface.co/spaces/tangguo1031/tgsnippets",
+          "https://huggingface.co/spaces/tangguo1031/tgsnippets", # 需要换成自己的Space的任务
           "https://huggingface.co/spaces/lycc17/n8n-free"
         ]
     steps:
