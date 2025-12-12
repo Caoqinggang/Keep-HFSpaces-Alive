@@ -1,8 +1,8 @@
-name: Keep Spaces Alive
+name: Keep Spaces Alive (Direct Hit)
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # 每6小时运行一次
+    - cron: "0 */6 * * *" # 每6小时
   workflow_dispatch:
 
 jobs:
@@ -16,91 +16,92 @@ jobs:
           "https://huggingface.co/spaces/lycc17/n8n-free"
         ]
     steps:
-      - name: Wake up and Check Status
+      - name: Wake up Space
         id: wake
         run: |
+          # 1. 基础信息解析
           SPACE_URL="${{ matrix.url }}"
-          # 提取 Space ID (去除 https 前缀)
-          REPO_ID=$(echo "$SPACE_URL" | sed 's/https:\/\/huggingface.co\/spaces\///')
-          API_URL="https://huggingface.co/api/spaces/$REPO_ID"
+          # 提取用户名和项目名 (例如 lycc17/n8n-free)
+          FULL_ID=$(echo "$SPACE_URL" | sed 's/https:\/\/huggingface.co\/spaces\///')
+          USERNAME=$(echo "$FULL_ID" | cut -d'/' -f1)
+          REPONAME=$(echo "$FULL_ID" | cut -d'/' -f2)
           
-          echo "🎯 Target: $REPO_ID"
-          echo "🔗 API: $API_URL"
+          # 2. 构造 直连域名 (Direct URL)
+          # HF 的规则是: https://用户名-项目名.hf.space
+          # 注意：如果项目名里有下划线，在域名里通常不需要变，但为了保险直接拼接
+          DIRECT_URL="https://${USERNAME}-${REPONAME}.hf.space"
+          
+          API_URL="https://huggingface.co/api/spaces/$FULL_ID"
 
-          # ==========================================
-          # 1. 强力唤醒 (The Knock)
-          # ==========================================
-          # -L: 跟随重定向 (关键修复，针对 n8n 等应用)
-          # -m 15: 请求超时15秒，防止卡死
-          echo "🚀 Sending initial wake-up request..."
-          curl -L -s -m 15 -A "Mozilla/5.0 Chrome/100.0" "$SPACE_URL" > /dev/null || true
+          echo "----------------------------------------"
+          echo "🎯 Target Space: $FULL_ID"
+          echo "🌐 Web URL:      $SPACE_URL"
+          echo "🔌 Direct URL:   $DIRECT_URL"
+          echo "----------------------------------------"
 
-          # ==========================================
-          # 2. 循环检测 (The Watch) - 最多等 10分钟
-          # ==========================================
-          MAX_RETRIES=60  # 60次
-          SLEEP_SEC=10    # 每次10秒
+          # 3. 强力唤醒逻辑 (The Hard Knock)
+          # 我们尝试多种方式去“敲门”，确保 Docker 收到请求
+          
+          wake_up() {
+             echo "🚀 Sending wake-up signals..."
+             # 方式A: 访问主页 (带 Referer)
+             curl -s -L -m 10 -A "Mozilla/5.0" "$SPACE_URL" -o /dev/null || true
+             # 方式B: 访问直连域名 (这是唤醒 n8n 的关键)
+             curl -s -L -m 10 -A "Mozilla/5.0" "$DIRECT_URL" -o /dev/null || true
+          }
+
+          # 4. 循环检测与持续唤醒
+          MAX_RETRIES=40 # 40次 * 15秒 = 10分钟
           FINAL_STATUS="failed"
-
+          
           for ((i=1; i<=MAX_RETRIES; i++)); do
-            # 获取 API 状态
+            # 每次检测前都发一次唤醒信号，防止信号丢失
+            wake_up
+
+            # 查 API 状态
             API_RESPONSE=$(curl -s "$API_URL")
             STAGE=$(echo "$API_RESPONSE" | jq -r '.runtime.stage')
-            
-            # 打印当前状态 (方便调试)
-            echo "Attempt $i/$MAX_RETRIES: Status = $STAGE"
-            
-            # 判断状态
+
+            echo "⏳ Attempt $i/$MAX_RETRIES | Status: $STAGE"
+
+            # 成功条件
             if [ "$STAGE" == "running" ]; then
-              echo "✅ Success! Space is running."
+              echo "✅ Space is RUNNING!"
               FINAL_STATUS="success"
               break
             fi
-
-            # 如果状态是 sleeping 或 stopped，说明之前的唤醒没生效，再次发送请求
-            if [ "$STAGE" == "sleeping" ] || [ "$STAGE" == "stopped" ] || [ "$STAGE" == "paused" ]; then
-               echo "💤 Space is still sleeping. Re-sending trigger..."
-               curl -L -s -m 15 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
-            fi
             
-            # 如果是 building，说明正在努力启动中，只需要等待
-            if [ "$STAGE" == "building" ] || [ "$STAGE" == "app_starting" ]; then
-               echo "🏗️ Space is building/starting... waiting..."
+            # 如果 API 报错或者返回 null (比如 API 变了)，我们尝试通过直连域名的 HTTP 状态码兜底
+            if [ "$STAGE" == "null" ] || [ -z "$STAGE" ]; then
+                echo "⚠️ API returned null. Checking HTTP status of Direct URL..."
+                HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}\n" -L -m 5 "$DIRECT_URL")
+                echo "   HTTP Code: $HTTP_CODE"
+                # 如果直连域名返回 200 或 401(需要登录但已启动)，都算成功
+                if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "401" ]; then
+                   echo "✅ Direct URL is responsive. Assuming Success."
+                   FINAL_STATUS="success"
+                   break
+                fi
             fi
 
-            sleep $SLEEP_SEC
+            sleep 15
           done
 
-          # ==========================================
-          # 3. 设置输出变量
-          # ==========================================
+          # 5. 输出结果
           echo "result=$FINAL_STATUS" >> $GITHUB_OUTPUT
-          
-          if [ "$FINAL_STATUS" == "success" ]; then
-            exit 0
-          else
-            echo "❌ Failed to wake up space within time limit."
-            # 不使用 exit 1，以免打断后续步骤，由输出变量控制通知
-            exit 0 
-          fi
 
       - name: Send Telegram Notification
         if: always()
         run: |
-          # 获取上一步的精确结果
           RESULT="${{ steps.wake.outputs.result }}"
-          
           if [ "$RESULT" == "success" ]; then
             STATUS_MSG="✅ 唤醒成功 (Running)"
           else
-            STATUS_MSG="❌ 唤醒失败 (Timeout/Error)"
+            STATUS_MSG="❌ 唤醒失败 (Timeout)"
           fi
 
           TIME=$(date "+%Y-%m-%d %H:%M:%S")
           MESSAGE="$STATUS_MSG%0ASpace: ${{ matrix.url }}%0ATime: $TIME"
-          
-          # 调试打印，确保你能在日志看到发送了什么
-          echo "Sending message: $MESSAGE"
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
           -d chat_id="${{ secrets.TG_ID }}" \
