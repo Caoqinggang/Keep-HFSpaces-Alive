@@ -1,8 +1,8 @@
-name: Keep Spaces Alive with Telegram Notify
+name: Keep Spaces Alive (API Check)
 
 on:
   schedule:
-    - cron: "0 */4 * * *" # 每4小时运行一次
+    - cron: "0 */6 * * *" # 建议每6小时一次，避免过于频繁
   workflow_dispatch:
 
 jobs:
@@ -11,58 +11,72 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # 格式必须是: https://huggingface.co/spaces/用户名/项目名
         url: [
           "https://huggingface.co/spaces/tangguo1031/tgsnippets",
           "https://huggingface.co/spaces/lycc17/n8n-free"
         ]
     steps:
-      - name: Ping Space
-        id: ping
+      - name: Wake up and Check Status
+        id: wake
         run: |
-          # 定义一个重试函数
-          check_url() {
-            # -L: 跟随重定向 (Follow redirects)
-            # -s: 静默
-            # --fail: 报错时返回非0状态码
-            # --max-time 60: 等待60秒，给容器启动时间
-            # User-Agent: 伪装成浏览器，避免被直接拦截
-            curl -L -s --fail --max-time 60 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$1"
-          }
-
-          echo "Trying to wake up ${{ matrix.url }}..."
+          # 1. 解析 Space ID (例如: tangguo1031/tgsnippets)
+          SPACE_URL="${{ matrix.url }}"
+          REPO_ID=$(echo "$SPACE_URL" | sed 's/https:\/\/huggingface.co\/spaces\///')
+          API_URL="https://huggingface.co/api/spaces/$REPO_ID"
           
-          # 第一次尝试
-          if check_url "${{ matrix.url }}"; then
-            echo "SUCCESS: Space is alive!"
-            echo "status=success" >> $GITHUB_OUTPUT
-          else
-            echo "WARNING: First attempt failed/timed out. Space might be sleeping. Waiting 30s..."
-            sleep 30
+          echo "Target Space: $REPO_ID"
+          
+          # 2. 初始触发 (发送请求以启动容器)
+          # -m 10: 最多等待10秒，我们要的只是触发，不需要等它加载完页面
+          echo "🚀 Triggering wake-up..."
+          curl -s -m 10 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
+
+          # 3. 循环检查 API 状态 (最多等待 5分钟 = 30次 * 10秒)
+          MAX_RETRIES=30
+          STATUS="unknown"
+          
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            # 调用 API 获取运行时状态
+            RESPONSE=$(curl -s "$API_URL")
+            # 使用 jq 解析 runtime.stage (GitHub Runner 自带 jq)
+            STATUS=$(echo "$RESPONSE" | jq -r '.runtime.stage')
             
-            # 第二次尝试 (给予更多启动时间)
-            if check_url "${{ matrix.url }}"; then
-              echo "SUCCESS: Space woke up on second attempt!"
+            echo "Attempt $i/$MAX_RETRIES: Current Status = $STATUS"
+            
+            if [ "$STATUS" == "running" ]; then
+              echo "✅ Space is officially RUNNING!"
               echo "status=success" >> $GITHUB_OUTPUT
-            else
-              echo "ERROR: Failed to wake up space after retries."
-              echo "status=failure" >> $GITHUB_OUTPUT
-              exit 1 # 标记步骤失败，但 continue-on-error 会捕获它
+              exit 0
             fi
-          fi
+            
+            # 如果是 sleeping/stopped，说明触发没成功，再次触发
+            if [ "$STATUS" == "stopped" ] || [ "$STATUS" == "sleeping" ]; then
+               echo "🔄 Space is asleep. Re-triggering..."
+               curl -s -m 10 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
+            fi
+
+            # 等待 10秒
+            sleep 10
+          done
+
+          # 如果循环结束还没 running，就是失败
+          echo "❌ Timeout: Space failed to enter RUNNING state."
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
         continue-on-error: true
 
       - name: Send Telegram Notification
         if: always()
         run: |
-          # 根据上一步的输出判断状态
-          if [ "${{ steps.ping.outputs.status }}" == "success" ]; then
-            STATUS="✅ 唤醒成功"
+          if [ "${{ steps.wake.outputs.status }}" == "success" ]; then
+            STATUS_MSG="✅ 唤醒成功 (Running)"
           else
-            STATUS="❌ 唤醒失败"
+            STATUS_MSG="❌ 唤醒失败/超时"
           fi
 
           TIME=$(date "+%Y-%m-%d %H:%M:%S")
-          MESSAGE="$STATUS%0ASpace: ${{ matrix.url }}%0ATime: $TIME"
+          MESSAGE="$STATUS_MSG%0ASpace: ${{ matrix.url }}%0ATime: $TIME"
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
           -d chat_id="${{ secrets.TG_ID }}" \
