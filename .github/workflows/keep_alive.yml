@@ -1,4 +1,4 @@
-name: Keep Spaces Alive (Direct Hit)
+name: Keep Spaces Alive
 
 on:
   schedule:
@@ -19,75 +19,67 @@ jobs:
       - name: Wake up Space
         id: wake
         run: |
-          # 1. 基础信息解析
           SPACE_URL="${{ matrix.url }}"
-          # 提取用户名和项目名 (例如 lycc17/n8n-free)
+          # 1. 提取 ID 和构造直连域名
           FULL_ID=$(echo "$SPACE_URL" | sed 's/https:\/\/huggingface.co\/spaces\///')
           USERNAME=$(echo "$FULL_ID" | cut -d'/' -f1)
           REPONAME=$(echo "$FULL_ID" | cut -d'/' -f2)
           
-          # 2. 构造 直连域名 (Direct URL)
-          # HF 的规则是: https://用户名-项目名.hf.space
-          # 注意：如果项目名里有下划线，在域名里通常不需要变，但为了保险直接拼接
+          # 构造直连域名: https://lycc17-n8n-free.hf.space
           DIRECT_URL="https://${USERNAME}-${REPONAME}.hf.space"
-          
           API_URL="https://huggingface.co/api/spaces/$FULL_ID"
 
-          echo "----------------------------------------"
-          echo "🎯 Target Space: $FULL_ID"
-          echo "🌐 Web URL:      $SPACE_URL"
-          echo "🔌 Direct URL:   $DIRECT_URL"
-          echo "----------------------------------------"
+          echo "🎯 Target: $FULL_ID"
+          echo "🔌 Direct URL: $DIRECT_URL"
 
-          # 3. 强力唤醒逻辑 (The Hard Knock)
-          # 我们尝试多种方式去“敲门”，确保 Docker 收到请求
-          
-          wake_up() {
-             echo "🚀 Sending wake-up signals..."
-             # 方式A: 访问主页 (带 Referer)
-             curl -s -L -m 10 -A "Mozilla/5.0" "$SPACE_URL" -o /dev/null || true
-             # 方式B: 访问直连域名 (这是唤醒 n8n 的关键)
-             curl -s -L -m 10 -A "Mozilla/5.0" "$DIRECT_URL" -o /dev/null || true
+          # 2. 唤醒函数 (同时请求主页和直连域名)
+          trigger_wake() {
+             curl -s -m 10 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
+             curl -s -m 10 -A "Mozilla/5.0" "$DIRECT_URL" > /dev/null || true
           }
 
-          # 4. 循环检测与持续唤醒
-          MAX_RETRIES=40 # 40次 * 15秒 = 10分钟
+          # 3. 循环检测 (宽松模式)
+          MAX_RETRIES=40
           FINAL_STATUS="failed"
-          
-          for ((i=1; i<=MAX_RETRIES; i++)); do
-            # 每次检测前都发一次唤醒信号，防止信号丢失
-            wake_up
 
-            # 查 API 状态
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            # 每一轮都尝试触发，确保没睡过去
+            trigger_wake
+
+            # --- 检测方式 A: API 状态 (作为参考) ---
             API_RESPONSE=$(curl -s "$API_URL")
             STAGE=$(echo "$API_RESPONSE" | jq -r '.runtime.stage')
+            
+            # --- 检测方式 B: HTTP 状态码 (作为最终依据) ---
+            # -w "%{http_code}" 仅输出状态码
+            # -o /dev/null 丢弃响应体
+            # 注意：这里不加 -L，我们要看原始状态码
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$DIRECT_URL")
 
-            echo "⏳ Attempt $i/$MAX_RETRIES | Status: $STAGE"
+            echo "⏳ Try $i: API='$STAGE' | HTTP_CODE='$HTTP_CODE'"
 
-            # 成功条件
+            # === 判定成功的核心逻辑 ===
+            # 1. 如果 API 明确说是 running -> 成功
             if [ "$STAGE" == "running" ]; then
-              echo "✅ Space is RUNNING!"
+              echo "✅ Detected RUNNING via API!"
               FINAL_STATUS="success"
               break
             fi
-            
-            # 如果 API 报错或者返回 null (比如 API 变了)，我们尝试通过直连域名的 HTTP 状态码兜底
-            if [ "$STAGE" == "null" ] || [ -z "$STAGE" ]; then
-                echo "⚠️ API returned null. Checking HTTP status of Direct URL..."
-                HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}\n" -L -m 5 "$DIRECT_URL")
-                echo "   HTTP Code: $HTTP_CODE"
-                # 如果直连域名返回 200 或 401(需要登录但已启动)，都算成功
-                if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "401" ]; then
-                   echo "✅ Direct URL is responsive. Assuming Success."
-                   FINAL_STATUS="success"
-                   break
-                fi
+
+            # 2. 如果 HTTP 状态码是 200-499 之间，说明服务器已经响应了 -> 成功
+            #    HF 启动中通常返回 503 或 000(超时)，所以只要不是 5xx，就是醒了
+            if [[ "$HTTP_CODE" =~ ^[234] ]]; then
+              echo "✅ Detected HTTP $HTTP_CODE (Server is responsive)!"
+              FINAL_STATUS="success"
+              break
             fi
 
+            # 3. 特殊情况：n8n 有时会返回 502 Bad Gateway 一小会儿然后才好
+            #    所以我们继续循环等待
+            
             sleep 15
           done
 
-          # 5. 输出结果
           echo "result=$FINAL_STATUS" >> $GITHUB_OUTPUT
 
       - name: Send Telegram Notification
@@ -95,9 +87,9 @@ jobs:
         run: |
           RESULT="${{ steps.wake.outputs.result }}"
           if [ "$RESULT" == "success" ]; then
-            STATUS_MSG="✅ 唤醒成功 (Running)"
+            STATUS_MSG="✅ 唤醒成功"
           else
-            STATUS_MSG="❌ 唤醒失败 (Timeout)"
+            STATUS_MSG="❌ 唤醒失败/超时"
           fi
 
           TIME=$(date "+%Y-%m-%d %H:%M:%S")
