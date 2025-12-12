@@ -1,8 +1,8 @@
-name: Keep Spaces Alive (API Check)
+name: Keep Spaces Alive
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # 建议每6小时一次，避免过于频繁
+    - cron: "0 */6 * * *" # 每6小时运行一次
   workflow_dispatch:
 
 jobs:
@@ -11,7 +11,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 格式必须是: https://huggingface.co/spaces/用户名/项目名
         url: [
           "https://huggingface.co/spaces/tangguo1031/tgsnippets",
           "https://huggingface.co/spaces/lycc17/n8n-free"
@@ -20,63 +19,88 @@ jobs:
       - name: Wake up and Check Status
         id: wake
         run: |
-          # 1. 解析 Space ID (例如: tangguo1031/tgsnippets)
           SPACE_URL="${{ matrix.url }}"
+          # 提取 Space ID (去除 https 前缀)
           REPO_ID=$(echo "$SPACE_URL" | sed 's/https:\/\/huggingface.co\/spaces\///')
           API_URL="https://huggingface.co/api/spaces/$REPO_ID"
           
-          echo "Target Space: $REPO_ID"
-          
-          # 2. 初始触发 (发送请求以启动容器)
-          # -m 10: 最多等待10秒，我们要的只是触发，不需要等它加载完页面
-          echo "🚀 Triggering wake-up..."
-          curl -s -m 10 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
+          echo "🎯 Target: $REPO_ID"
+          echo "🔗 API: $API_URL"
 
-          # 3. 循环检查 API 状态 (最多等待 5分钟 = 30次 * 10秒)
-          MAX_RETRIES=30
-          STATUS="unknown"
-          
+          # ==========================================
+          # 1. 强力唤醒 (The Knock)
+          # ==========================================
+          # -L: 跟随重定向 (关键修复，针对 n8n 等应用)
+          # -m 15: 请求超时15秒，防止卡死
+          echo "🚀 Sending initial wake-up request..."
+          curl -L -s -m 15 -A "Mozilla/5.0 Chrome/100.0" "$SPACE_URL" > /dev/null || true
+
+          # ==========================================
+          # 2. 循环检测 (The Watch) - 最多等 10分钟
+          # ==========================================
+          MAX_RETRIES=60  # 60次
+          SLEEP_SEC=10    # 每次10秒
+          FINAL_STATUS="failed"
+
           for ((i=1; i<=MAX_RETRIES; i++)); do
-            # 调用 API 获取运行时状态
-            RESPONSE=$(curl -s "$API_URL")
-            # 使用 jq 解析 runtime.stage (GitHub Runner 自带 jq)
-            STATUS=$(echo "$RESPONSE" | jq -r '.runtime.stage')
+            # 获取 API 状态
+            API_RESPONSE=$(curl -s "$API_URL")
+            STAGE=$(echo "$API_RESPONSE" | jq -r '.runtime.stage')
             
-            echo "Attempt $i/$MAX_RETRIES: Current Status = $STATUS"
+            # 打印当前状态 (方便调试)
+            echo "Attempt $i/$MAX_RETRIES: Status = $STAGE"
             
-            if [ "$STATUS" == "running" ]; then
-              echo "✅ Space is officially RUNNING!"
-              echo "status=success" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            
-            # 如果是 sleeping/stopped，说明触发没成功，再次触发
-            if [ "$STATUS" == "stopped" ] || [ "$STATUS" == "sleeping" ]; then
-               echo "🔄 Space is asleep. Re-triggering..."
-               curl -s -m 10 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
+            # 判断状态
+            if [ "$STAGE" == "running" ]; then
+              echo "✅ Success! Space is running."
+              FINAL_STATUS="success"
+              break
             fi
 
-            # 等待 10秒
-            sleep 10
+            # 如果状态是 sleeping 或 stopped，说明之前的唤醒没生效，再次发送请求
+            if [ "$STAGE" == "sleeping" ] || [ "$STAGE" == "stopped" ] || [ "$STAGE" == "paused" ]; then
+               echo "💤 Space is still sleeping. Re-sending trigger..."
+               curl -L -s -m 15 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
+            fi
+            
+            # 如果是 building，说明正在努力启动中，只需要等待
+            if [ "$STAGE" == "building" ] || [ "$STAGE" == "app_starting" ]; then
+               echo "🏗️ Space is building/starting... waiting..."
+            fi
+
+            sleep $SLEEP_SEC
           done
 
-          # 如果循环结束还没 running，就是失败
-          echo "❌ Timeout: Space failed to enter RUNNING state."
-          echo "status=failure" >> $GITHUB_OUTPUT
-          exit 1
-        continue-on-error: true
+          # ==========================================
+          # 3. 设置输出变量
+          # ==========================================
+          echo "result=$FINAL_STATUS" >> $GITHUB_OUTPUT
+          
+          if [ "$FINAL_STATUS" == "success" ]; then
+            exit 0
+          else
+            echo "❌ Failed to wake up space within time limit."
+            # 不使用 exit 1，以免打断后续步骤，由输出变量控制通知
+            exit 0 
+          fi
 
       - name: Send Telegram Notification
         if: always()
         run: |
-          if [ "${{ steps.wake.outputs.status }}" == "success" ]; then
+          # 获取上一步的精确结果
+          RESULT="${{ steps.wake.outputs.result }}"
+          
+          if [ "$RESULT" == "success" ]; then
             STATUS_MSG="✅ 唤醒成功 (Running)"
           else
-            STATUS_MSG="❌ 唤醒失败/超时"
+            STATUS_MSG="❌ 唤醒失败 (Timeout/Error)"
           fi
 
           TIME=$(date "+%Y-%m-%d %H:%M:%S")
           MESSAGE="$STATUS_MSG%0ASpace: ${{ matrix.url }}%0ATime: $TIME"
+          
+          # 调试打印，确保你能在日志看到发送了什么
+          echo "Sending message: $MESSAGE"
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
           -d chat_id="${{ secrets.TG_ID }}" \
