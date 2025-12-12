@@ -2,48 +2,68 @@ name: Keep Spaces Alive with Telegram Notify
 
 on:
   schedule:
-    - cron: "0 */12 * * *" # 每12小时运行一次
-  workflow_dispatch:    # 允许手动触发
+    - cron: "0 */4 * * *" # 每4小时运行一次
+  workflow_dispatch:
 
 jobs:
   ping-and-notify:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false # 如果一个Space失败，不要取消其他Space的任务
+      fail-fast: false
       matrix:
         url: [
-          "https://huggingface.co/spaces/tangguo1031/tgsnippets", # 需要换成自己的Space的任务
+          "https://huggingface.co/spaces/tangguo1031/tgsnippets",
           "https://huggingface.co/spaces/lycc17/n8n-free"
         ]
     steps:
-      # 1. 尝试唤醒 Space
       - name: Ping Space
         id: ping
-        # -I: 只请求头信息
-        # -s: 静默模式
-        # --fail: 遇到 400/500 错误时返回失败代码
-        # --max-time 10: 10秒超时防止卡死
-        run: curl -Is --fail --max-time 10 ${{ matrix.url }}
-        continue-on-error: true # 关键：即使失败也继续执行，为了发通知
-
-      # 2. 发送 Telegram 通知
-      - name: Send Telegram Notification
-        if: always() # 无论上一步成功与否都执行
         run: |
-          # 判断上一步的状态
-          if [ "${{ steps.ping.outcome }}" == "success" ]; then
+          # 定义一个重试函数
+          check_url() {
+            # -L: 跟随重定向 (Follow redirects)
+            # -s: 静默
+            # --fail: 报错时返回非0状态码
+            # --max-time 60: 等待60秒，给容器启动时间
+            # User-Agent: 伪装成浏览器，避免被直接拦截
+            curl -L -s --fail --max-time 60 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$1"
+          }
+
+          echo "Trying to wake up ${{ matrix.url }}..."
+          
+          # 第一次尝试
+          if check_url "${{ matrix.url }}"; then
+            echo "SUCCESS: Space is alive!"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "WARNING: First attempt failed/timed out. Space might be sleeping. Waiting 30s..."
+            sleep 30
+            
+            # 第二次尝试 (给予更多启动时间)
+            if check_url "${{ matrix.url }}"; then
+              echo "SUCCESS: Space woke up on second attempt!"
+              echo "status=success" >> $GITHUB_OUTPUT
+            else
+              echo "ERROR: Failed to wake up space after retries."
+              echo "status=failure" >> $GITHUB_OUTPUT
+              exit 1 # 标记步骤失败，但 continue-on-error 会捕获它
+            fi
+          fi
+        continue-on-error: true
+
+      - name: Send Telegram Notification
+        if: always()
+        run: |
+          # 根据上一步的输出判断状态
+          if [ "${{ steps.ping.outputs.status }}" == "success" ]; then
             STATUS="✅ 唤醒成功"
           else
             STATUS="❌ 唤醒失败"
           fi
 
-          # 获取当前时间
           TIME=$(date "+%Y-%m-%d %H:%M:%S")
-          
-          # 拼接消息内容
           MESSAGE="$STATUS%0ASpace: ${{ matrix.url }}%0ATime: $TIME"
 
-          # 发送请求给 Telegram Bot API
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
           -d chat_id="${{ secrets.TG_ID }}" \
           -d text="$MESSAGE"
