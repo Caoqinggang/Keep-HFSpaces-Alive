@@ -1,8 +1,7 @@
 name: Keep Spaces Alive
-
 on:
   schedule:
-    - cron: "0 */6 * * *" # 每6小时
+    - cron: "0 */6 * * *" # 每6小时运行一次
   workflow_dispatch:
 
 jobs:
@@ -19,65 +18,61 @@ jobs:
       - name: Wake up Space
         id: wake
         run: |
+          # ============================================
+          # ⚙️ Configuration (在这里调整时间)
+          # ============================================
+          MAX_WAIT_MINUTES=10    # 最大等待时间 (分钟) - n8n 建议至少 10
+          CHECK_INTERVAL=15      # 每次检查间隔 (秒)
+          # ============================================
+
+          # 自动计算循环次数
+          MAX_RETRIES=$((MAX_WAIT_MINUTES * 60 / CHECK_INTERVAL))
+          
           SPACE_URL="${{ matrix.url }}"
-          # 1. 提取 ID 和构造直连域名
           FULL_ID=$(echo "$SPACE_URL" | sed 's/https:\/\/huggingface.co\/spaces\///')
           USERNAME=$(echo "$FULL_ID" | cut -d'/' -f1)
           REPONAME=$(echo "$FULL_ID" | cut -d'/' -f2)
-          
-          # 构造直连域名: https://lycc17-n8n-free.hf.space
           DIRECT_URL="https://${USERNAME}-${REPONAME}.hf.space"
-          API_URL="https://huggingface.co/api/spaces/$FULL_ID"
-
+          
           echo "🎯 Target: $FULL_ID"
           echo "🔌 Direct URL: $DIRECT_URL"
+          echo "⏱️ Max Wait: $MAX_WAIT_MINUTES mins ($MAX_RETRIES retries)"
 
-          # 2. 唤醒函数 (同时请求主页和直连域名)
+          # 唤醒函数
           trigger_wake() {
+             # -m 10: 10秒连接超时
              curl -s -m 10 -A "Mozilla/5.0" "$SPACE_URL" > /dev/null || true
              curl -s -m 10 -A "Mozilla/5.0" "$DIRECT_URL" > /dev/null || true
           }
 
-          # 3. 循环检测 (宽松模式)
-          MAX_RETRIES=40
           FINAL_STATUS="failed"
+          START_TIME=$(date +%s)
 
           for ((i=1; i<=MAX_RETRIES; i++)); do
-            # 每一轮都尝试触发，确保没睡过去
+            # 1. 发送唤醒信号
             trigger_wake
 
-            # --- 检测方式 A: API 状态 (作为参考) ---
-            API_RESPONSE=$(curl -s "$API_URL")
-            STAGE=$(echo "$API_RESPONSE" | jq -r '.runtime.stage')
+            # 2. 检测 HTTP 状态码 (最可靠的方法)
+            # -L: 跟随跳转 (n8n 启动后通常会跳到 /login)
+            # -w: 只输出状态码
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -L -m 10 "$DIRECT_URL")
             
-            # --- 检测方式 B: HTTP 状态码 (作为最终依据) ---
-            # -w "%{http_code}" 仅输出状态码
-            # -o /dev/null 丢弃响应体
-            # 注意：这里不加 -L，我们要看原始状态码
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$DIRECT_URL")
+            # 计算已耗时
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
 
-            echo "⏳ Try $i: API='$STAGE' | HTTP_CODE='$HTTP_CODE'"
+            echo "🔄 Attempt $i/$MAX_RETRIES (${ELAPSED}s elapsed) | HTTP Code: $CODE"
 
-            # === 判定成功的核心逻辑 ===
-            # 1. 如果 API 明确说是 running -> 成功
-            if [ "$STAGE" == "running" ]; then
-              echo "✅ Detected RUNNING via API!"
+            # 3. 判定成功逻辑
+            # 只要状态码是 200-499 之间，说明服务器已启动并能响应请求
+            # (排除 000 连接失败 和 502/503 服务未就绪)
+            if [[ "$CODE" =~ ^[234] ]]; then
+              echo "✅ Space matches success criteria (HTTP $CODE)!"
               FINAL_STATUS="success"
               break
             fi
 
-            # 2. 如果 HTTP 状态码是 200-499 之间，说明服务器已经响应了 -> 成功
-            #    HF 启动中通常返回 503 或 000(超时)，所以只要不是 5xx，就是醒了
-            if [[ "$HTTP_CODE" =~ ^[234] ]]; then
-              echo "✅ Detected HTTP $HTTP_CODE (Server is responsive)!"
-              FINAL_STATUS="success"
-              break
-            fi
-
-            # 3. 特殊情况：n8n 有时会返回 502 Bad Gateway 一小会儿然后才好
-            #    所以我们继续循环等待
-            
-            sleep 15
+            sleep $CHECK_INTERVAL
           done
 
           echo "result=$FINAL_STATUS" >> $GITHUB_OUTPUT
@@ -87,9 +82,9 @@ jobs:
         run: |
           RESULT="${{ steps.wake.outputs.result }}"
           if [ "$RESULT" == "success" ]; then
-            STATUS_MSG="✅ 唤醒成功"
+            STATUS_MSG="✅ 唤醒成功 (Running)"
           else
-            STATUS_MSG="❌ 唤醒失败/超时"
+            STATUS_MSG="❌ 唤醒失败 (Timeout)"
           fi
 
           TIME=$(date "+%Y-%m-%d %H:%M:%S")
